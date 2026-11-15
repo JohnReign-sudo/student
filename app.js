@@ -1,4 +1,3 @@
-
 const $ = s => document.querySelector(s);
 
 const API_BASE = 'https://studyflow-api-t3p9.onrender.com';
@@ -108,10 +107,10 @@ async function saveTaskOnline(task, isEditing) {
   const body = {
     title: task.title,
     subject: task.subject,
-    description: task.notes,
-    due_date: task.date,
+    date: task.date,
     priority: task.priority,
-    completed: task.done
+    notes: task.notes,
+    done: task.done
   };
 
   if (isEditing) {
