@@ -1,27 +1,15 @@
 
 const express = require("express");
 const cors = require("cors");
-const { Pool } = require("pg");
+const { pool, initializeDatabase } = require("./database");
 
 const app = express();
 
 app.use(express.json());
-
-app.use(cors({
-  origin: process.env.FRONTEND_URL || true
-}));
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === "true"
-    ? { rejectUnauthorized: false }
-    : false
-});
+app.use(cors());
 
 app.get("/", (req, res) => {
-  res.json({
-    message: "StudyFlow API is running!"
-  });
+  res.json({ message: "StudyFlow API is running!" });
 });
 
 app.get("/api/health", async (req, res) => {
@@ -41,6 +29,17 @@ app.get("/api/health", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  console.log(`StudyFlow server running on port ${PORT}`);
-});
+async function startServer() {
+  try {
+    await initializeDatabase();
+
+    app.listen(PORT, () => {
+      console.log(`StudyFlow running on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error("Database initialization failed:", error);
+    process.exit(1);
+  }
+}
+
+startServer();
