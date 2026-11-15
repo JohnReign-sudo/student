@@ -27,8 +27,17 @@ async function initializeDatabase() {
       description TEXT DEFAULT '',
       due_date TEXT,
       completed BOOLEAN DEFAULT FALSE,
+      subject TEXT DEFAULT '',
+      priority TEXT DEFAULT 'normal',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+  `);
+
+  // Add missing columns to existing databases
+  await pool.query(`
+    ALTER TABLE tasks
+    ADD COLUMN IF NOT EXISTS subject TEXT DEFAULT '',
+    ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'normal';
   `);
 
   console.log("StudyFlow database tables are ready.");
