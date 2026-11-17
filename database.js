@@ -33,11 +33,23 @@ async function initializeDatabase() {
     );
   `);
 
-  // Add missing columns to existing databases
   await pool.query(`
     ALTER TABLE tasks
     ADD COLUMN IF NOT EXISTS subject TEXT DEFAULT '',
     ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'normal';
+  `);
+
+  // Store push notification subscriptions for each account/device.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id)
+        ON DELETE CASCADE,
+      endpoint TEXT NOT NULL UNIQUE,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   console.log("StudyFlow database tables are ready.");
