@@ -1,5 +1,5 @@
 
-const CACHE = 'studyflow-v2';
+const CACHE = 'studyflow-v3';
 
 const FILES = [
   './',
@@ -32,6 +32,7 @@ self.addEventListener('activate', event => {
   );
 });
 
+// Handle normal website requests.
 self.addEventListener('fetch', event => {
   const request = event.request;
 
@@ -62,5 +63,61 @@ self.addEventListener('fetch', event => {
 
         return caches.match('./index.html');
       })
+  );
+});
+
+// Handle push notifications from the server.
+self.addEventListener('push', event => {
+  let data = {};
+
+  if (event.data) {
+    try {
+      data = event.data.json();
+    } catch {
+      data = {
+        title: 'StudyFlow Reminder',
+        body: event.data.text()
+      };
+    }
+  }
+
+  const title = data.title || 'StudyFlow Reminder';
+
+  const options = {
+    body: data.body || 'You have an upcoming task deadline.',
+    icon: './icon.svg',
+    badge: './icon.svg',
+    data: {
+      url: data.url || './'
+    }
+  };
+
+  event.waitUntil(
+    self.registration.showNotification(title, options)
+  );
+});
+
+// Open StudyFlow when a notification is tapped.
+self.addEventListener('notificationclick', event => {
+  event.notification.close();
+
+  const targetUrl = new URL(
+    event.notification.data?.url || './',
+    self.location.origin
+  ).href;
+
+  event.waitUntil(
+    clients.matchAll({
+      type: 'window',
+      includeUncontrolled: true
+    }).then(windowClients => {
+      for (const client of windowClients) {
+        if (client.url.startsWith(self.location.origin)) {
+          return client.focus();
+        }
+      }
+
+      return clients.openWindow(targetUrl);
+    })
   );
 });
