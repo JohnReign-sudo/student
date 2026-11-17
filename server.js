@@ -3,6 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const webPush = require("web-push");
 const { pool, initializeDatabase } = require("./database");
 
 const app = express();
@@ -26,6 +27,25 @@ function authenticate(req, res, next) {
       error: "Invalid or expired session."
     });
   }
+}
+
+// PUSH CONFIGURATION
+function configurePush() {
+  if (
+    !process.env.VAPID_PUBLIC_KEY ||
+    !process.env.VAPID_PRIVATE_KEY
+  ) {
+    console.warn("Push notifications are not configured.");
+    return false;
+  }
+
+  webPush.setVapidDetails(
+    "https://johnreign-sudo.github.io/student/",
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+
+  return true;
 }
 
 // REGISTER
@@ -74,8 +94,10 @@ app.post("/api/login", async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    if (typeof username !== "string" ||
-        typeof password !== "string") {
+    if (
+      typeof username !== "string" ||
+      typeof password !== "string"
+    ) {
       return res.status(400).json({
         error: "Enter your username and password."
       });
@@ -123,7 +145,7 @@ app.get("/api/me", authenticate, (req, res) => {
   res.json({ user: req.user });
 });
 
-// GET TASKS BELONGING TO LOGGED-IN STUDENT
+// GET TASKS
 app.get("/api/tasks", authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -258,6 +280,160 @@ app.delete("/api/tasks/:id", authenticate, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Could not delete task." });
+  }
+});
+
+// GET PUBLIC PUSH KEY
+app.get("/api/push/public-key", (req, res) => {
+  if (!process.env.VAPID_PUBLIC_KEY) {
+    return res.status(503).json({
+      error: "Push notifications are not configured."
+    });
+  }
+
+  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
+});
+
+// SAVE PUSH SUBSCRIPTION FOR LOGGED-IN USER
+app.post("/api/push/subscribe", authenticate, async (req, res) => {
+  try {
+    const subscription = req.body;
+
+    if (
+      !subscription ||
+      typeof subscription.endpoint !== "string" ||
+      !subscription.endpoint.startsWith("https://") ||
+      typeof subscription.keys?.p256dh !== "string" ||
+      typeof subscription.keys?.auth !== "string"
+    ) {
+      return res.status(400).json({
+        error: "Invalid push subscription."
+      });
+    }
+
+    await pool.query(
+      `INSERT INTO push_subscriptions
+       (user_id, endpoint, p256dh, auth)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (endpoint)
+       DO UPDATE SET
+         user_id = EXCLUDED.user_id,
+         p256dh = EXCLUDED.p256dh,
+         auth = EXCLUDED.auth`,
+      [
+        req.user.id,
+        subscription.endpoint,
+        subscription.keys.p256dh,
+        subscription.keys.auth
+      ]
+    );
+
+    res.json({ message: "Notifications enabled successfully." });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Could not save notification subscription."
+    });
+  }
+});
+
+// REMOVE PUSH SUBSCRIPTION
+app.post("/api/push/unsubscribe", authenticate, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+
+    if (typeof endpoint !== "string") {
+      return res.status(400).json({
+        error: "Invalid subscription endpoint."
+      });
+    }
+
+    await pool.query(
+      `DELETE FROM push_subscriptions
+       WHERE endpoint = $1 AND user_id = $2`,
+      [endpoint, req.user.id]
+    );
+
+    res.json({ message: "Notifications disabled." });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Could not disable notifications."
+    });
+  }
+});
+
+// SEND A TEST NOTIFICATION TO THE LOGGED-IN USER
+app.post("/api/push/test", authenticate, async (req, res) => {
+  try {
+    if (!configurePush()) {
+      return res.status(503).json({
+        error: "Push notifications are not configured."
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT endpoint, p256dh, auth
+       FROM push_subscriptions
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({
+        error: "No notification subscription found. Enable notifications first."
+      });
+    }
+
+    const payload = JSON.stringify({
+      title: "StudyFlow",
+      body: "Your test notification is working!",
+      url: "/"
+    });
+
+    const outcomes = await Promise.allSettled(
+      result.rows.map(async (row) => {
+        const subscription = {
+          endpoint: row.endpoint,
+          keys: {
+            p256dh: row.p256dh,
+            auth: row.auth
+          }
+        };
+
+        try {
+          await webPush.sendNotification(subscription, payload);
+        } catch (error) {
+          if (error.statusCode === 404 || error.statusCode === 410) {
+            await pool.query(
+              "DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_id = $2",
+              [row.endpoint, req.user.id]
+            );
+          }
+          throw error;
+        }
+      })
+    );
+
+    const sent = outcomes.filter(
+      (item) => item.status === "fulfilled"
+    ).length;
+
+    if (!sent) {
+      return res.status(502).json({
+        error: "The test notification could not be delivered."
+      });
+    }
+
+    res.json({
+      message: "Test notification sent.",
+      sent
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Could not send test notification."
+    });
   }
 });
 
