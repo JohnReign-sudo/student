@@ -1,3 +1,4 @@
+
 const $ = s => document.querySelector(s);
 
 const API_BASE = 'https://studyflow-api-t3p9.onrender.com';
@@ -131,6 +132,7 @@ async function saveTaskOnline(task, isEditing) {
 // Registration/login screen
 function setAuthMode() {
   $('#authSubmit').textContent = isRegistering ? 'Create account' : 'Log in';
+
   $('#authToggle').textContent = isRegistering
     ? 'Already have an account? Log in'
     : 'Create a new account';
@@ -240,6 +242,7 @@ async function start() {
   try {
     const me = await api('/api/me');
     user = me.user.username;
+
     localStorage.setItem('studyflow_username', user);
 
     $('#loginView').classList.add('hidden');
@@ -424,6 +427,7 @@ document.addEventListener('click', async e => {
       await api(`/api/tasks/${encodeURIComponent(del.dataset.delete)}`, {
         method: 'DELETE'
       });
+
       await loadTasks();
       toast('Task deleted');
     } catch (error) {
@@ -516,18 +520,85 @@ $('#nextMonth').onclick = () => {
   renderCalendar();
 };
 
-// Notifications
+// Notifications - Web Push
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding)
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+
+  const rawData = atob(base64);
+
+  return Uint8Array.from(
+    [...rawData].map(char => char.charCodeAt(0))
+  );
+}
+
 $('#notifyBtn').onclick = async () => {
-  if (!('Notification' in window)) {
-    toast('Notifications are not supported in this browser');
-    return;
+  try {
+    if (!token) {
+      toast('Please log in first.');
+      return;
+    }
+
+    if (!('serviceWorker' in navigator) ||
+        !('PushManager' in window) ||
+        !('Notification' in window)) {
+      toast('Web Push is not supported in this browser.');
+      return;
+    }
+
+    if (!window.isSecureContext) {
+      toast('Notifications require a secure HTTPS connection.');
+      return;
+    }
+
+    const permission = await Notification.requestPermission();
+
+    if (permission !== 'granted') {
+      toast('Notification permission was not granted.');
+      return;
+    }
+
+    toast('Connecting notifications...');
+
+    const registration = await navigator.serviceWorker.ready;
+
+    const keyData = await api('/api/push/public-key');
+
+    if (!keyData.publicKey) {
+      throw new Error('The push public key was not returned by the server.');
+    }
+
+    const applicationServerKey =
+      urlBase64ToUint8Array(keyData.publicKey);
+
+    let subscription = await registration.pushManager.getSubscription();
+
+    if (!subscription) {
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey
+      });
+    }
+
+    await api('/api/push/subscribe', {
+      method: 'POST',
+      body: JSON.stringify(subscription)
+    });
+
+    toast('Notifications enabled! Sending a test...');
+
+    await api('/api/push/test', {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+
+    toast('Success! Check your notifications.');
+  } catch (error) {
+    console.error('Push notification error:', error);
+    toast(error.message || 'Could not enable notifications.');
   }
-
-  const p = await Notification.requestPermission();
-
-  toast(p === 'granted'
-    ? 'Reminders enabled. Keep the app/browser available to receive reminders.'
-    : 'Notification permission was not granted');
 };
 
 // Restore saved appearance
@@ -538,7 +609,9 @@ if (localStorage.getItem('studyflow_dark') === '1') {
 // Service worker
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
+    navigator.serviceWorker.register('./sw.js').catch(error => {
+      console.error('Service worker registration failed:', error);
+    });
   });
 }
 
