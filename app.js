@@ -15,6 +15,7 @@ let page = 'dashboard';
 let calDate = new Date();
 let selectedDate = todayISO();
 let isRegistering = false;
+let isSyncing = false;
 
 const quotes = [
   "You don't have to do everything at once. Just start.",
@@ -23,6 +24,58 @@ const quotes = [
   "A little effort every day adds up.",
   "Stay focused on the next step, not the whole staircase."
 ];
+
+// OFFLINE STORAGE
+
+function taskStorageKey() {
+  return `studyflow_tasks_${user}`;
+}
+
+function queueStorageKey() {
+  return `studyflow_queue_${user}`;
+}
+
+function loadTasksLocally() {
+  if (!user) return [];
+
+  try {
+    return JSON.parse(localStorage.getItem(taskStorageKey()) || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function saveTasksLocally() {
+  if (!user) return;
+
+  localStorage.setItem(taskStorageKey(), JSON.stringify(tasks));
+}
+
+function getQueue() {
+  if (!user) return [];
+
+  try {
+    return JSON.parse(localStorage.getItem(queueStorageKey()) || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function saveQueue(queue) {
+  if (!user) return;
+
+  localStorage.setItem(queueStorageKey(), JSON.stringify(queue));
+}
+
+function addToQueue(action) {
+  const queue = getQueue();
+  queue.push(action);
+  saveQueue(queue);
+}
+
+function makeLocalId() {
+  return 'local-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+}
 
 function toast(msg) {
   const t = $('#toast');
@@ -53,7 +106,8 @@ function escapeHTML(s = '') {
   }[c]));
 }
 
-// API helper
+// API HELPER
+
 async function api(path, options = {}) {
   const headers = {
     'Content-Type': 'application/json',
@@ -71,7 +125,9 @@ async function api(path, options = {}) {
 
   const data = await response.json().catch(() => ({}));
 
-  if (response.status === 401 && path !== '/api/login' && path !== '/api/register') {
+  if (response.status === 401 &&
+      path !== '/api/login' &&
+      path !== '/api/register') {
     logout(false);
     throw new Error('Your session expired. Please log in again.');
   }
@@ -83,7 +139,8 @@ async function api(path, options = {}) {
   return data;
 }
 
-// Convert database task into the format used by the website
+// FORMAT TASKS
+
 function formatTask(t) {
   return {
     id: t.id,
@@ -96,16 +153,8 @@ function formatTask(t) {
   };
 }
 
-// Load this account's tasks
-async function loadTasks() {
-  const data = await api('/api/tasks');
-  tasks = (data.tasks || []).map(formatTask);
-  render();
-}
-
-// Save a task to the database
-async function saveTaskOnline(task, isEditing) {
-  const body = {
+function taskBody(task) {
+  return {
     title: task.title,
     subject: task.subject,
     date: task.date,
@@ -113,6 +162,37 @@ async function saveTaskOnline(task, isEditing) {
     notes: task.notes,
     done: task.done
   };
+}
+
+// LOAD TASKS
+
+async function loadTasks() {
+  try {
+    const data = await api('/api/tasks');
+    const serverTasks = (data.tasks || []).map(formatTask);
+
+    // Keep unsynced local tasks while online tasks are refreshed.
+    const localTasks = tasks.filter(t =>
+      String(t.id).startsWith('local-')
+    );
+
+    tasks = [...serverTasks, ...localTasks];
+
+    saveTasksLocally();
+    render();
+
+    return true;
+  } catch (error) {
+    tasks = loadTasksLocally();
+    render();
+    throw error;
+  }
+}
+
+// SAVE TASKS ONLINE
+
+async function saveTaskOnline(task, isEditing) {
+  const body = taskBody(task);
 
   if (isEditing) {
     await api(`/api/tasks/${encodeURIComponent(task.id)}`, {
@@ -129,7 +209,164 @@ async function saveTaskOnline(task, isEditing) {
   await loadTasks();
 }
 
-// Registration/login screen
+// OFFLINE TASK CHANGES
+
+async function saveTask(task, isEditing) {
+  const oldTasks = [...tasks];
+  const oldTask = tasks.find(t => String(t.id) === String(task.id));
+
+  if (isEditing) {
+    tasks = tasks.map(t =>
+      String(t.id) === String(task.id) ? task : t
+    );
+  } else {
+    task.id = makeLocalId();
+    tasks.push(task);
+  }
+
+  saveTasksLocally();
+  render();
+
+  try {
+    if (!navigator.onLine) {
+      throw new Error('You are offline.');
+    }
+
+    if (String(task.id).startsWith('local-')) {
+      const result = await api('/api/tasks', {
+        method: 'POST',
+        body: JSON.stringify(taskBody(task))
+      });
+
+      const serverTask = result.task || result;
+      if (serverTask.id) {
+        task.id = serverTask.id;
+        tasks = tasks.map(t =>
+          String(t.id) === String(task.id) ||
+          String(t.id).startsWith('local-') &&
+          t.title === task.title &&
+          t.date === task.date
+            ? task
+            : t
+        );
+        saveTasksLocally();
+      }
+
+      await loadTasks();
+    } else {
+      await saveTaskOnline(task, isEditing);
+    }
+
+    toast('Task saved successfully!');
+  } catch (error) {
+    // Queue only changes that still need to reach the server.
+    const queue = getQueue();
+
+    if (isEditing) {
+      const existing = queue.findIndex(q =>
+        String(q.id) === String(task.id)
+      );
+
+      if (existing !== -1 && queue[existing].type === 'create') {
+        queue[existing].body = taskBody(task);
+      } else if (existing !== -1) {
+        queue[existing] = {
+          type: 'update',
+          id: task.id,
+          body: taskBody(task)
+        };
+      } else {
+        queue.push({
+          type: 'update',
+          id: task.id,
+          body: taskBody(task)
+        });
+      }
+    } else {
+      queue.push({
+        type: 'create',
+        id: task.id,
+        body: taskBody(task)
+      });
+    }
+
+    saveQueue(queue);
+    saveTasksLocally();
+    render();
+
+    toast('Saved on this device. Will sync when online.');
+  }
+}
+
+// SYNC PENDING TASKS
+
+async function syncPendingTasks() {
+  if (!token || !user || !navigator.onLine || isSyncing) return;
+
+  const queue = getQueue();
+  if (!queue.length) return;
+
+  isSyncing = true;
+  const remaining = [];
+
+  try {
+    for (const action of queue) {
+      try {
+        if (action.type === 'create') {
+          const result = await api('/api/tasks', {
+            method: 'POST',
+            body: JSON.stringify(action.body)
+          });
+
+          const created = result.task || result;
+
+          if (created.id) {
+            tasks = tasks.map(t =>
+              String(t.id) === String(action.id)
+                ? formatTask(created)
+                : t
+            );
+          }
+        }
+
+        if (action.type === 'update') {
+          await api(`/api/tasks/${encodeURIComponent(action.id)}`, {
+            method: 'PUT',
+            body: JSON.stringify(action.body)
+          });
+        }
+
+        if (action.type === 'delete') {
+          await api(`/api/tasks/${encodeURIComponent(action.id)}`, {
+            method: 'DELETE'
+          });
+        }
+      } catch (error) {
+        remaining.push(action);
+
+        // Keep later operations in order if one fails.
+        const index = queue.indexOf(action);
+        remaining.push(...queue.slice(index + 1));
+        break;
+      }
+    }
+
+    saveQueue(remaining);
+
+    if (remaining.length === 0) {
+      await loadTasks();
+      toast('Your offline changes have synced!');
+    } else {
+      saveTasksLocally();
+      render();
+    }
+  } finally {
+    isSyncing = false;
+  }
+}
+
+// AUTH SCREEN
+
 function setAuthMode() {
   $('#authSubmit').textContent = isRegistering ? 'Create account' : 'Log in';
 
@@ -154,7 +391,8 @@ $('#authToggle').addEventListener('click', () => {
   setAuthMode();
 });
 
-// Log in or register
+// LOGIN AND REGISTRATION
+
 $('#loginForm').addEventListener('submit', async e => {
   e.preventDefault();
 
@@ -201,14 +439,17 @@ $('#loginForm').addEventListener('submit', async e => {
     await start();
     toast('Welcome to StudyFlow!');
   } catch (error) {
-    toast(error.message);
+    toast(navigator.onLine
+      ? error.message
+      : 'Internet required for your first login. Try again when online.');
   } finally {
     button.disabled = false;
     setAuthMode();
   }
 });
 
-// Log out
+// LOGOUT
+
 function logout(showMessage = true) {
   token = '';
   user = '';
@@ -231,47 +472,90 @@ $('#switchUser').onclick = () => {
   }
 };
 
-// Start application
+// START APP
+
 async function start() {
-  if (!token) {
+  if (!token || !user) {
     $('#loginView').classList.remove('hidden');
     $('#appView').classList.add('hidden');
     return;
   }
 
-  try {
-    const me = await api('/api/me');
-    user = me.user.username;
+  $('#loginView').classList.add('hidden');
+  $('#appView').classList.remove('hidden');
 
-    localStorage.setItem('studyflow_username', user);
+  $('#sideUser').textContent = user;
+  $('#avatar').textContent = user[0].toUpperCase();
+  $('#welcomeTitle').textContent = `Welcome back, ${user}!`;
 
-    $('#loginView').classList.add('hidden');
-    $('#appView').classList.remove('hidden');
+  $('#todayLabel').textContent = new Date().toLocaleDateString(
+    undefined,
+    { weekday:'long', month:'long', day:'numeric' }
+  ).toUpperCase();
 
-    $('#sideUser').textContent = user;
-    $('#avatar').textContent = user[0].toUpperCase();
-    $('#welcomeTitle').textContent = `Welcome back, ${user}!`;
+  $('#quoteText').textContent =
+    quotes[new Date().getDate() % quotes.length];
 
-    $('#todayLabel').textContent = new Date().toLocaleDateString(
-      undefined,
-      { weekday:'long', month:'long', day:'numeric' }
-    ).toUpperCase();
+  // Show local tasks immediately.
+  tasks = loadTasksLocally();
+  render();
 
-    $('#quoteText').textContent =
-      quotes[new Date().getDate() % quotes.length];
+  if (navigator.onLine) {
+    try {
+      await loadTasks();
+      await syncPendingTasks();
+    } catch (error) {
+      console.log('Using offline tasks:', error.message);
+    }
+  }
 
-    await loadTasks();
-  } catch (error) {
-    toast(error.message);
+  updateConnectionStatus();
+}
+
+// CONNECTION STATUS
+
+function updateConnectionStatus() {
+  let status = $('#connectionStatus');
+
+  if (!status) {
+    status = document.createElement('div');
+    status.id = 'connectionStatus';
+    status.style.cssText =
+      'position:fixed;bottom:12px;right:12px;z-index:9999;padding:8px 12px;border-radius:20px;font-size:12px;background:#333;color:white;';
+    document.body.appendChild(status);
+  }
+
+  const pending = getQueue().length;
+
+  if (navigator.onLine) {
+    status.textContent = pending
+      ? `Online · ${pending} pending changes`
+      : 'Online';
+  } else {
+    status.textContent = 'Offline · Changes saved on device';
   }
 }
 
-// Dashboard and task display
+window.addEventListener('online', async () => {
+  updateConnectionStatus();
+  toast('Internet connection restored. Syncing...');
+  await syncPendingTasks();
+  updateConnectionStatus();
+});
+
+window.addEventListener('offline', () => {
+  updateConnectionStatus();
+  toast('You are offline. Tasks will be saved locally.');
+});
+
+// DASHBOARD
+
 function render() {
   renderStats();
   renderUpcoming();
   renderTasks();
   renderCalendar();
+  updateConnectionStatus();
 }
 
 function renderStats() {
@@ -293,7 +577,7 @@ function renderStats() {
 function taskHTML(t) {
   return `<div class="task-row ${t.done ? 'done' : ''}">
     <input class="task-check" type="checkbox"
-      data-done="${t.id}" ${t.done ? 'checked' : ''}
+      data-done="${escapeHTML(t.id)}" ${t.done ? 'checked' : ''}
       aria-label="Mark completed">
 
     <div class="task-info">
@@ -309,9 +593,9 @@ function taskHTML(t) {
     </span>
 
     <div class="row-actions">
-      <button class="mini-btn" data-edit="${t.id}"
+      <button class="mini-btn" data-edit="${escapeHTML(t.id)}"
         aria-label="Edit task">✎</button>
-      <button class="mini-btn" data-delete="${t.id}"
+      <button class="mini-btn" data-delete="${escapeHTML(t.id)}"
         aria-label="Delete task">×</button>
     </div>
   </div>`;
@@ -370,7 +654,8 @@ function openTask(t) {
   $('#taskDialog').showModal();
 }
 
-// Calendar
+// CALENDAR
+
 function renderCalendar() {
   const y = calDate.getFullYear();
   const m = calDate.getMonth();
@@ -407,7 +692,8 @@ function renderCalendar() {
       : '<div class="empty">No tasks due on this day.</div>');
 }
 
-// Navigation and task actions
+// NAVIGATION AND TASK ACTIONS
+
 document.addEventListener('click', async e => {
   const n = e.target.closest('[data-page]');
   if (n) showPage(n.dataset.page);
@@ -422,16 +708,35 @@ document.addEventListener('click', async e => {
   }
 
   const del = e.target.closest('[data-delete]');
-  if (del && confirm('Delete this task?')) {
-    try {
-      await api(`/api/tasks/${encodeURIComponent(del.dataset.delete)}`, {
-        method: 'DELETE'
-      });
 
-      await loadTasks();
+  if (del && confirm('Delete this task?')) {
+    const id = del.dataset.delete;
+    const task = tasks.find(t => String(t.id) === id);
+
+    if (!task) return;
+
+    tasks = tasks.filter(t => String(t.id) !== id);
+    saveTasksLocally();
+    render();
+
+    const queue = getQueue();
+
+    if (String(id).startsWith('local-')) {
+      saveQueue(queue.filter(q => String(q.id) !== id));
       toast('Task deleted');
-    } catch (error) {
-      toast(error.message);
+    } else {
+      try {
+        if (!navigator.onLine) throw new Error('Offline');
+
+        await api(`/api/tasks/${encodeURIComponent(id)}`, {
+          method: 'DELETE'
+        });
+
+        toast('Task deleted');
+      } catch {
+        addToQueue({ type: 'delete', id });
+        toast('Deleted locally. Will sync when online.');
+      }
     }
   }
 
@@ -442,7 +747,8 @@ document.addEventListener('click', async e => {
   }
 });
 
-// Complete or reopen a task
+// COMPLETE TASK
+
 document.addEventListener('change', async e => {
   if (!e.target.matches('[data-done]')) return;
 
@@ -452,17 +758,55 @@ document.addEventListener('change', async e => {
   const oldDone = t.done;
   t.done = e.target.checked;
 
+  saveTasksLocally();
+  render();
+
   try {
-    await saveTaskOnline(t, true);
+    if (!navigator.onLine) throw new Error('Offline');
+
+    if (String(t.id).startsWith('local-')) {
+      const queue = getQueue();
+      const create = queue.find(q =>
+        q.type === 'create' && String(q.id) === String(t.id)
+      );
+
+      if (create) {
+        create.body = taskBody(t);
+        saveQueue(queue);
+      } else {
+        throw new Error('Offline');
+      }
+    } else {
+      await api(`/api/tasks/${encodeURIComponent(t.id)}`, {
+        method: 'PUT',
+        body: JSON.stringify(taskBody(t))
+      });
+    }
+
     toast(t.done ? 'Task completed!' : 'Task reopened');
-  } catch (error) {
-    t.done = oldDone;
-    render();
-    toast(error.message);
+  } catch {
+    const queue = getQueue();
+    const existing = queue.find(q =>
+      String(q.id) === String(t.id) && q.type !== 'delete'
+    );
+
+    if (existing) {
+      existing.body = taskBody(t);
+    } else if (!String(t.id).startsWith('local-')) {
+      queue.push({
+        type: 'update',
+        id: t.id,
+        body: taskBody(t)
+      });
+    }
+
+    saveQueue(queue);
+    toast('Saved on this device. Will sync later.');
   }
 });
 
-// Add or edit a task
+// ADD OR EDIT TASK
+
 $('#taskForm').addEventListener('submit', async e => {
   e.preventDefault();
 
@@ -470,7 +814,7 @@ $('#taskForm').addEventListener('submit', async e => {
   const old = tasks.find(t => String(t.id) === id);
 
   const task = {
-    id,
+    id: id || makeLocalId(),
     title: $('#taskTitle').value.trim(),
     subject: $('#taskSubject').value.trim(),
     date: $('#taskDate').value,
@@ -479,27 +823,31 @@ $('#taskForm').addEventListener('submit', async e => {
     done: old?.done || false
   };
 
-  try {
-    await saveTaskOnline(task, Boolean(id));
-    $('#taskDialog').close();
-    toast('Task saved successfully!');
-  } catch (error) {
-    toast(error.message);
+  if (!task.title || !task.date) {
+    toast('Please enter a task title and due date.');
+    return;
   }
+
+  await saveTask(task, Boolean(id));
+
+  $('#taskDialog').close();
 });
 
-// Dialog controls
+// DIALOG CONTROLS
+
 $('#addTaskBtn').onclick = () => openTask();
 
 $('#closeDialog').onclick = $('#cancelDialog').onclick = () => {
   $('#taskDialog').close();
 };
 
-// Search and filters
+// SEARCH AND FILTERS
+
 $('#searchTasks').oninput = renderTasks;
 $('#filterTasks').onchange = renderTasks;
 
-// Dark mode
+// DARK MODE
+
 $('#themeBtn').onclick = () => {
   document.body.classList.toggle('dark');
 
@@ -509,7 +857,8 @@ $('#themeBtn').onclick = () => {
   );
 };
 
-// Calendar navigation
+// CALENDAR NAVIGATION
+
 $('#prevMonth').onclick = () => {
   calDate.setMonth(calDate.getMonth()-1);
   renderCalendar();
@@ -520,7 +869,8 @@ $('#nextMonth').onclick = () => {
   renderCalendar();
 };
 
-// Notifications - Web Push
+// NOTIFICATIONS - WEB PUSH
+
 function urlBase64ToUint8Array(base64String) {
   const padding = '='.repeat((4 - base64String.length % 4) % 4);
   const base64 = (base64String + padding)
@@ -563,7 +913,6 @@ $('#notifyBtn').onclick = async () => {
     toast('Connecting notifications...');
 
     const registration = await navigator.serviceWorker.ready;
-
     const keyData = await api('/api/push/public-key');
 
     if (!keyData.publicKey) {
@@ -601,12 +950,14 @@ $('#notifyBtn').onclick = async () => {
   }
 };
 
-// Restore saved appearance
+// RESTORE APPEARANCE
+
 if (localStorage.getItem('studyflow_dark') === '1') {
   document.body.classList.add('dark');
 }
 
-// Service worker
+// SERVICE WORKER
+
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('./sw.js').catch(error => {
@@ -615,6 +966,7 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-// Initial setup
+// INITIAL SETUP
+
 setAuthMode();
 start();
